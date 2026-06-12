@@ -232,6 +232,88 @@ except ModuleNotFoundError:
 import shutil
 from pathlib import Path
 
+# Prometheus is optional. When the package is missing, --prometheus-port
+# exits cleanly with a hint and metric call-sites become no-ops via the
+# stub classes below.
+try:
+    from prometheus_client import Counter, Gauge, Histogram, start_http_server
+    PROMETHEUS_AVAILABLE = True
+except ImportError:
+    PROMETHEUS_AVAILABLE = False
+
+    class _NoOpMetric:
+        def labels(self, *_a, **_k):
+            return self
+
+        def inc(self, *_a, **_k):
+            pass
+
+        def set(self, *_a, **_k):
+            pass
+
+        def observe(self, *_a, **_k):
+            pass
+
+    def Counter(*_a, **_k):
+        return _NoOpMetric()
+
+    def Gauge(*_a, **_k):
+        return _NoOpMetric()
+
+    def Histogram(*_a, **_k):
+        return _NoOpMetric()
+
+    def start_http_server(*_a, **_k):
+        return None
+
+# Session-duration histogram buckets (seconds): 1m, 5m, 15m, 30m, 1h, 2h,
+# 4h, 6h, 8h, 12h, 24h — covers everything from quick lobby drops to
+# all-day binges without exploding label cardinality.
+SESSION_BUCKETS = (60, 300, 900, 1800, 3600, 7200, 14400, 21600, 28800, 43200, 86400)
+
+PROM_USER_ONLINE = Gauge(
+    "psn_user_online",
+    "1 if the PSN user is online, 0 if offline",
+    ["user"],
+)
+PROM_USER_IN_GAME = Gauge(
+    "psn_user_in_game",
+    "1 if the user is currently in this game; cleared on game change / offline",
+    ["user", "game"],
+)
+PROM_GAME_SESSIONS = Counter(
+    "psn_game_sessions_total",
+    "Number of finished game sessions",
+    ["user", "game"],
+)
+PROM_GAME_SESSION_SECONDS = Histogram(
+    "psn_game_session_seconds",
+    "Per-session play duration, observed at the point a game session ends",
+    ["user", "game"],
+    buckets=SESSION_BUCKETS,
+)
+PROM_ONLINE_SESSIONS = Counter(
+    "psn_online_sessions_total",
+    "Number of completed online sessions",
+    ["user"],
+)
+PROM_ONLINE_SESSION_SECONDS = Histogram(
+    "psn_online_session_seconds",
+    "Online-session duration, observed when the user transitions to offline",
+    ["user"],
+    buckets=SESSION_BUCKETS,
+)
+PROM_POLLS = Counter(
+    "psn_polls_total",
+    "Number of presence polls performed against the PSN API",
+    ["user"],
+)
+PROM_POLL_ERRORS = Counter(
+    "psn_poll_errors_total",
+    "Number of presence polls that raised an exception",
+    ["user", "kind"],
+)
+
 
 # Probes the PSN OAuth endpoint with the given npsso and returns a specific error hint if the redirect carries a recognizable error such as ToSUA re-acceptance, otherwise None
 def probe_npsso_auth_error(npsso):
@@ -1691,6 +1773,9 @@ def psn_monitor_user(psn_user_id, csv_file_name):
         print(f"\nUser is currently in-game:\t{game_name}{launchplatform_str}")
         game_ts_old = int(time.time())
         games_number += 1
+        PROM_USER_IN_GAME.labels(user=psn_user_id, game=game_name).set(1)
+
+    PROM_USER_ONLINE.labels(user=psn_user_id).set(0 if status == "offline" else 1)
 
     if last_status_ts == 0:
         if lastonline_ts and status == "offline":
@@ -1797,6 +1882,7 @@ def psn_monitor_user(psn_user_id, csv_file_name):
         if platform.system() != 'Windows':
             signal.signal(signal.SIGALRM, timeout_handler)
             signal.alarm(FUNCTION_TIMEOUT)
+        PROM_POLLS.labels(user=psn_user_id).inc()
         try:
             psn_user_presence = psn_user.get_presence()
             parsed = parse_presence(psn_user_presence)
@@ -1814,6 +1900,7 @@ def psn_monitor_user(psn_user_id, csv_file_name):
         except TimeoutException:
             if platform.system() != 'Windows':
                 signal.alarm(0)
+            PROM_POLL_ERRORS.labels(user=psn_user_id, kind="timeout").inc()
             print(f"psn_user.get_presence() timeout, retrying in {display_time(FUNCTION_TIMEOUT)}")
             print_cur_ts("Timestamp:\t\t\t")
             time.sleep(FUNCTION_TIMEOUT)
@@ -1824,6 +1911,7 @@ def psn_monitor_user(psn_user_id, csv_file_name):
                 signal.alarm(0)
 
             kind = classify_psn_exception(e)
+            PROM_POLL_ERRORS.labels(user=psn_user_id, kind=kind or "unknown").inc()
 
             # Fatal local fd exhaustion — cannot recover in-process
             if kind == "exhausted":
@@ -1977,6 +2065,7 @@ def psn_monitor_user(psn_user_id, csv_file_name):
                     m_body_short_offline_msg = f"\n\n{short_offline_msg}"
                     print(short_offline_msg)
                 act_inact_flag = True
+                PROM_USER_ONLINE.labels(user=psn_user_id).set(1)
 
             m_body_played_games = ""
 
@@ -1996,9 +2085,15 @@ def psn_monitor_user(psn_user_id, csv_file_name):
                     m_body_played_games = f"\n\nUser played {games_number} games for total time of {display_time(game_total_ts)}"
                     print(f"User played {games_number} games for total time of {display_time(game_total_ts)}")
                 print(f"*** User got OFFLINE ! {online_since_msg}")
+                if status_online_start_ts > 0:
+                    PROM_ONLINE_SESSIONS.labels(user=psn_user_id).inc()
+                    PROM_ONLINE_SESSION_SECONDS.labels(user=psn_user_id).observe(
+                        max(0, int(status_ts) - int(status_online_start_ts))
+                    )
                 status_online_start_ts_old = status_online_start_ts
                 status_online_start_ts = 0
                 act_inact_flag = True
+                PROM_USER_ONLINE.labels(user=psn_user_id).set(0)
 
             m_body_user_in_game = ""
             if status != "offline" and game_name:
@@ -2026,6 +2121,10 @@ def psn_monitor_user(psn_user_id, csv_file_name):
             if launchplatform:
                 launchplatform_str = f" ({launchplatform})"
 
+            # Duration of the just-ended game session, if any. Used both by
+            # the upstream stats block above and the Prometheus histogram.
+            ended_session_seconds = max(0, int(game_ts) - int(game_ts_old)) if game_name_old else 0
+
             # User changed the game
             if game_name_old and game_name:
                 print(f"PSN user {psn_user_id} changed game from '{game_name_old}' to '{game_name}'{launchplatform_str} after {calculate_timespan(int(game_ts), int(game_ts_old))}")
@@ -2036,6 +2135,10 @@ def psn_monitor_user(psn_user_id, csv_file_name):
                 if launchplatform:
                     launchplatform_str = f"{launchplatform}, "
                 m_subject = f"PSN user {psn_user_id} changed game to '{game_name}' ({launchplatform_str}after {calculate_timespan(int(game_ts), int(game_ts_old), show_seconds=False)}: {get_range_of_dates_from_tss(int(game_ts_old), int(game_ts), short=True)})"
+                PROM_USER_IN_GAME.labels(user=psn_user_id, game=game_name_old).set(0)
+                PROM_GAME_SESSIONS.labels(user=psn_user_id, game=game_name_old).inc()
+                PROM_GAME_SESSION_SECONDS.labels(user=psn_user_id, game=game_name_old).observe(ended_session_seconds)
+                PROM_USER_IN_GAME.labels(user=psn_user_id, game=game_name).set(1)
 
             # User started playing new game
             elif not game_name_old and game_name:
@@ -2043,6 +2146,7 @@ def psn_monitor_user(psn_user_id, csv_file_name):
                 games_number += 1
                 m_subject = f"PSN user {psn_user_id} now plays '{game_name}'{launchplatform_str}"
                 m_body = f"PSN user {psn_user_id} now plays '{game_name}'{launchplatform_str}{get_cur_ts(nl_ch + nl_ch + 'Timestamp: ')}"
+                PROM_USER_IN_GAME.labels(user=psn_user_id, game=game_name).set(1)
 
             # User stopped playing the game
             elif game_name_old and not game_name:
@@ -2052,6 +2156,9 @@ def psn_monitor_user(psn_user_id, csv_file_name):
                     game_total_ts += (int(game_ts) - int(game_ts_old))
                 m_subject = f"PSN user {psn_user_id} stopped playing '{game_name_old}' (after {calculate_timespan(int(game_ts), int(game_ts_old), show_seconds=False)}: {get_range_of_dates_from_tss(int(game_ts_old), int(game_ts), short=True)})"
                 m_body = f"PSN user {psn_user_id} stopped playing '{game_name_old}' after {calculate_timespan(int(game_ts), int(game_ts_old))}\n\nUser played game from {get_range_of_dates_from_tss(int(game_ts_old), int(game_ts), short=True, between_sep=' to ')}{get_cur_ts(nl_ch + nl_ch + 'Timestamp: ')}"
+                PROM_USER_IN_GAME.labels(user=psn_user_id, game=game_name_old).set(0)
+                PROM_GAME_SESSIONS.labels(user=psn_user_id, game=game_name_old).inc()
+                PROM_GAME_SESSION_SECONDS.labels(user=psn_user_id, game=game_name_old).observe(ended_session_seconds)
 
             change = True
 
@@ -2239,6 +2346,14 @@ def main():
         default=None,
         help="Disable logging to psn_monitor_<psn_user_id>.log"
     )
+    opts.add_argument(
+        "--prometheus-port",
+        dest="prometheus_port",
+        metavar="PORT",
+        type=int,
+        default=None,
+        help="Start a Prometheus metrics HTTP server on PORT (requires the 'prometheus_client' package)"
+    )
 
     args = parser.parse_args()
 
@@ -2403,6 +2518,14 @@ def main():
     print(f"* Configuration file:\t\t{cfg_path}")
     print(f"* Dotenv file:\t\t\t{env_path or 'None'}")
     print(f"* Local timezone:\t\t{LOCAL_TIMEZONE}")
+
+    if args.prometheus_port:
+        if not PROMETHEUS_AVAILABLE:
+            print("* Error: --prometheus-port requires the 'prometheus_client' package")
+            print("  Install it with: pip install prometheus-client")
+            sys.exit(1)
+        start_http_server(args.prometheus_port)
+        print(f"* Prometheus metrics:\t\thttp://0.0.0.0:{args.prometheus_port}/metrics")
 
     out = f"\nMonitoring user with PSN ID {args.psn_user_id}"
     print(out)

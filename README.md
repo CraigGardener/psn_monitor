@@ -436,6 +436,52 @@ Example:
 grc tail -F -n 100 psn_monitor_<psn_user_id>.log
 ```
 
+<a id="prometheus-metrics"></a>
+### Prometheus Metrics
+
+Expose live activity counters/gauges/histograms on an HTTP endpoint that
+Prometheus can scrape. Requires the optional `prometheus-client`
+package:
+
+```sh
+pip install psn_monitor[prometheus]
+# or:  pip install prometheus-client
+```
+
+Start the monitor with `--prometheus-port`:
+
+```sh
+psn_monitor --prometheus-port 9595 <psn_user_id>
+# metrics available at http://0.0.0.0:9595/metrics
+```
+
+Series exposed:
+
+| Metric | Type | Labels | Purpose |
+|---|---|---|---|
+| `psn_user_online` | gauge | `user` | 1 if online, 0 if offline |
+| `psn_user_in_game` | gauge | `user`, `game` | 1 while a game is active |
+| `psn_game_sessions_total` | counter | `user`, `game` | Total finished game sessions |
+| `psn_game_session_seconds` | histogram | `user`, `game` | Per-session play durations (1m → 24h buckets) |
+| `psn_online_sessions_total` | counter | `user` | Total online sessions |
+| `psn_online_session_seconds` | histogram | `user` | Online-session durations |
+| `psn_polls_total` | counter | `user` | Presence polls performed |
+| `psn_poll_errors_total` | counter | `user`, `kind` | Polls that raised an exception (kind: `auth`, `timeout`, …) |
+
+Sample PromQL:
+
+```promql
+# Total time the user has spent in each game
+sum by (game) (psn_game_session_seconds_sum)
+
+# Median session length per game over the last week
+histogram_quantile(0.5, sum by (game, le) (rate(psn_game_session_seconds_bucket[7d])))
+
+# Sessions ≥ 4 hours in the last 30 days
+sum by (game) (increase(psn_game_session_seconds_bucket{le="+Inf"}[30d]))
+  - on (game) sum by (game) (increase(psn_game_session_seconds_bucket{le="14400"}[30d]))
+```
+
 <a id="change-log"></a>
 ## Change Log
 

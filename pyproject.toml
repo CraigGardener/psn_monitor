@@ -19,6 +19,9 @@ dependencies = [
   "tzlocal>=4.0",
   "python-dotenv>=0.19",
 ]
+
+[project.optional-dependencies]
+prometheus = ["prometheus-client>=0.17"]
 classifiers = [
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.10",

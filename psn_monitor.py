@@ -571,6 +571,91 @@ class ErrorAlertState:
         setattr(self, f"{channel}_retry_at", now + delay)
         print(f"* The {channel} alert is on hold for {display_time(delay)} after {failures} {'attempt' if failures == 1 else 'attempts'}, then tried again")
 
+# Prometheus is optional. When the package is missing, --prometheus-port
+# exits cleanly with a hint and metric call-sites become no-ops via the
+# stub classes below.
+try:
+    from prometheus_client import Counter, Gauge, Histogram, start_http_server
+    PROMETHEUS_AVAILABLE = True
+except ImportError:
+    PROMETHEUS_AVAILABLE = False
+
+    class _NoOpMetric:
+        def labels(self, *_a, **_k):
+            return self
+
+        def inc(self, *_a, **_k):
+            pass
+
+        def set(self, *_a, **_k):
+            pass
+
+        def observe(self, *_a, **_k):
+            pass
+
+    def Counter(*_a, **_k):
+        return _NoOpMetric()
+
+    def Gauge(*_a, **_k):
+        return _NoOpMetric()
+
+    def Histogram(*_a, **_k):
+        return _NoOpMetric()
+
+    def start_http_server(*_a, **_k):
+        return None
+
+# Session-duration histogram buckets (seconds): 1m, 5m, 15m, 30m, 1h, 2h,
+# 4h, 6h, 8h, 12h, 24h — covers everything from quick lobby drops to
+# all-day binges without exploding label cardinality.
+# Set from --prometheus-port in main(); reported by the startup summary
+PROMETHEUS_PORT = None
+
+SESSION_BUCKETS = (60, 300, 900, 1800, 3600, 7200, 14400, 21600, 28800, 43200, 86400)
+
+PROM_USER_ONLINE = Gauge(
+    "psn_user_online",
+    "1 if the PSN user is online, 0 if offline",
+    ["user"],
+)
+PROM_USER_IN_GAME = Gauge(
+    "psn_user_in_game",
+    "1 if the user is currently in this game; cleared on game change / offline",
+    ["user", "game"],
+)
+PROM_GAME_SESSIONS = Counter(
+    "psn_game_sessions_total",
+    "Number of finished game sessions",
+    ["user", "game"],
+)
+PROM_GAME_SESSION_SECONDS = Histogram(
+    "psn_game_session_seconds",
+    "Per-session play duration, observed at the point a game session ends",
+    ["user", "game"],
+    buckets=SESSION_BUCKETS,
+)
+PROM_ONLINE_SESSIONS = Counter(
+    "psn_online_sessions_total",
+    "Number of completed online sessions",
+    ["user"],
+)
+PROM_ONLINE_SESSION_SECONDS = Histogram(
+    "psn_online_session_seconds",
+    "Online-session duration, observed when the user transitions to offline",
+    ["user"],
+    buckets=SESSION_BUCKETS,
+)
+PROM_POLLS = Counter(
+    "psn_polls_total",
+    "Number of presence polls performed against the PSN API",
+    ["user"],
+)
+PROM_POLL_ERRORS = Counter(
+    "psn_poll_errors_total",
+    "Number of presence polls that raised an exception",
+    ["user", "kind"],
+)
+
 
 # Probes the PSN OAuth endpoint with the given npsso and returns a specific error hint if the redirect carries a recognizable error such as ToSUA re-acceptance, otherwise None
 def probe_npsso_auth_error(npsso):
@@ -4808,6 +4893,9 @@ def psn_monitor_user(psn_user_id, csv_file_name):
         print(f"\nUser is currently in-game:\t{game_name}{launchplatform_str}")
         game_ts_old = int(time.time())
         games_number += 1
+        PROM_USER_IN_GAME.labels(user=psn_user_id, game=game_name).set(1)
+
+    PROM_USER_ONLINE.labels(user=psn_user_id).set(0 if status == "offline" else 1)
 
     if last_status_ts == 0:
         if lastonline_ts and status == "offline":
@@ -4950,6 +5038,7 @@ def psn_monitor_user(psn_user_id, csv_file_name):
             signal.signal(signal.SIGALRM, timeout_handler)
             signal.alarm(FUNCTION_TIMEOUT)
         debug_print("Starting check", check=f"#{check_number}", user=psn_user_id, operation="PSN API get_presence()", timeout=f"{FUNCTION_TIMEOUT}s")
+        PROM_POLLS.labels(user=psn_user_id).inc()
         try:
             psn_user_presence = psn_user.get_presence()
             parsed = parse_presence(psn_user_presence)
@@ -4974,6 +5063,7 @@ def psn_monitor_user(psn_user_id, csv_file_name):
             advice = classify_recovery_error(e, context="monitor", detail=halted_detail, probe_auth=True)
             kind = recovery_poll_kind(advice)
             debug_print("Check", check=f"#{check_number}", recovery_code=advice.code, policy=kind, outcome="failed", error=f"{type(e).__name__}: {e}")
+            PROM_POLL_ERRORS.labels(user=psn_user_id, kind=kind or "unknown").inc()
 
             # Local file descriptor exhaustion cannot be recovered inside this process
             if kind == "exhausted":
@@ -5097,6 +5187,7 @@ def psn_monitor_user(psn_user_id, csv_file_name):
                     m_body_short_offline_msg_html = f"<br><br>Short offline interruption (<b>{html_text(display_time(status_ts - status_ts_old))}</b>), online start timestamp set back to <b>{html_text(get_short_date_from_ts(status_online_start_ts_old))}</b>"
                     print(short_offline_msg)
                 act_inact_flag = True
+                PROM_USER_ONLINE.labels(user=psn_user_id).set(1)
 
             m_body_played_games = ""
             m_body_played_games_html = ""
@@ -5119,9 +5210,15 @@ def psn_monitor_user(psn_user_id, csv_file_name):
                     m_body_played_games_html = f"<br><br>User played <b>{games_number}</b> games for total time of <b>{html_text(display_time(game_total_ts))}</b>"
                     print(f"User played {games_number} games for total time of {display_time(game_total_ts)}")
                 print(f"*** User got OFFLINE ! {online_since_msg}")
+                if status_online_start_ts > 0:
+                    PROM_ONLINE_SESSIONS.labels(user=psn_user_id).inc()
+                    PROM_ONLINE_SESSION_SECONDS.labels(user=psn_user_id).observe(
+                        max(0, int(status_ts) - int(status_online_start_ts))
+                    )
                 status_online_start_ts_old = status_online_start_ts
                 status_online_start_ts = 0
                 act_inact_flag = True
+                PROM_USER_ONLINE.labels(user=psn_user_id).set(0)
 
             m_body_user_in_game = ""
             m_body_user_in_game_html = ""
@@ -5154,6 +5251,10 @@ def psn_monitor_user(psn_user_id, csv_file_name):
             if launchplatform:
                 launchplatform_str = f" ({launchplatform})"
 
+            # Duration of the just-ended game session, if any. Used both by
+            # the upstream stats block above and the Prometheus histogram.
+            ended_session_seconds = max(0, int(game_ts) - int(game_ts_old)) if game_name_old else 0
+
             # User changed the game
             if game_name_old and game_name:
                 print(f"PSN user {psn_user_id} changed game from '{game_name_old}' to '{game_name}'{launchplatform_str} after {calculate_timespan(int(game_ts), int(game_ts_old))}")
@@ -5165,6 +5266,10 @@ def psn_monitor_user(psn_user_id, csv_file_name):
                 if launchplatform:
                     launchplatform_str = f"{launchplatform}, "
                 m_subject = f"PSN user {psn_user_id} changed game to '{game_name}' ({launchplatform_str}after {calculate_timespan(int(game_ts), int(game_ts_old), show_seconds=False)}: {get_range_of_dates_from_tss(int(game_ts_old), int(game_ts), short=True)})"
+                PROM_USER_IN_GAME.labels(user=psn_user_id, game=game_name_old).set(0)
+                PROM_GAME_SESSIONS.labels(user=psn_user_id, game=game_name_old).inc()
+                PROM_GAME_SESSION_SECONDS.labels(user=psn_user_id, game=game_name_old).observe(ended_session_seconds)
+                PROM_USER_IN_GAME.labels(user=psn_user_id, game=game_name).set(1)
 
             # User started playing new game
             elif not game_name_old and game_name:
@@ -5173,6 +5278,7 @@ def psn_monitor_user(psn_user_id, csv_file_name):
                 m_subject = f"PSN user {psn_user_id} now plays '{game_name}'{launchplatform_str}"
                 m_body = f"PSN user {psn_user_id} now plays '{game_name}'{launchplatform_str}{get_cur_ts(nl_ch + nl_ch + 'Timestamp: ')}"
                 m_body_html = html_email_body(f"PSN user {psn_user_html(psn_user_id)} now plays '{psn_game_html(game_name)}'{html_text(launchplatform_str)}{get_cur_ts('<br><br>Timestamp: ')}")
+                PROM_USER_IN_GAME.labels(user=psn_user_id, game=game_name).set(1)
 
             # User stopped playing the game
             elif game_name_old and not game_name:
@@ -5183,6 +5289,9 @@ def psn_monitor_user(psn_user_id, csv_file_name):
                 m_subject = f"PSN user {psn_user_id} stopped playing '{game_name_old}' (after {calculate_timespan(int(game_ts), int(game_ts_old), show_seconds=False)}: {get_range_of_dates_from_tss(int(game_ts_old), int(game_ts), short=True)})"
                 m_body = f"PSN user {psn_user_id} stopped playing '{game_name_old}' after {calculate_timespan(int(game_ts), int(game_ts_old))}\n\nUser played game from {get_range_of_dates_from_tss(int(game_ts_old), int(game_ts), short=True, between_sep=' to ')}{get_cur_ts(nl_ch + nl_ch + 'Timestamp: ')}"
                 m_body_html = html_email_body(f"PSN user {psn_user_html(psn_user_id)} stopped playing '{psn_game_html(game_name_old)}' after <b>{html_text(calculate_timespan(int(game_ts), int(game_ts_old)))}</b><br><br>User played game from {html_text(get_range_of_dates_from_tss(int(game_ts_old), int(game_ts), short=True, between_sep=' to '))}{get_cur_ts('<br><br>Timestamp: ')}")
+                PROM_USER_IN_GAME.labels(user=psn_user_id, game=game_name_old).set(0)
+                PROM_GAME_SESSIONS.labels(user=psn_user_id, game=game_name_old).inc()
+                PROM_GAME_SESSION_SECONDS.labels(user=psn_user_id, game=game_name_old).observe(ended_session_seconds)
 
             change = True
 
@@ -5964,6 +6073,7 @@ def build_startup_summary(psn_user_id=None, config_path=None, env_path=None, log
         StartupSummaryRow("Liveness output", display_time(LIVENESS_CHECK_INTERVAL) if LIVENESS_CHECK_INTERVAL else "Disabled", concise=bool(LIVENESS_CHECK_INTERVAL)),
         StartupSummaryRow("CSV output", CSV_FILE or "Disabled", concise=bool(CSV_FILE)),
         StartupSummaryRow("Status file", resolve_status_file(psn_user_id) if psn_user_id else "None"),
+        StartupSummaryRow("Prometheus metrics", f"http://0.0.0.0:{PROMETHEUS_PORT}/metrics" if PROMETHEUS_PORT else "Disabled", concise=bool(PROMETHEUS_PORT)),
         StartupSummaryRow("Terminal truncation", f"{TRUNCATE_CHARS} chars" if TRUNCATE_CHARS else "Disabled", concise=bool(TRUNCATE_CHARS)),
         StartupSummaryRow("Process id", str(os.getpid())),
         StartupSummaryRow("Python version", platform.python_version()),
@@ -7526,7 +7636,7 @@ def run_set_smtp_password(env_file=None, config_path=None, psn_user_id=None, int
 
 # Resolves command-line actions and initializes the selected runtime mode
 def main():
-    global CLI_CONFIG_PATH, CONFIG_DISCOVERY_DISABLED, DOTENV_FILE, PSN_STATUS_FILE, LOCAL_TIMEZONE, LOCAL_TIMEZONE_STATE, LIVENESS_REMINDER_SECONDS, PSN_NPSSO, CSV_FILE, DISABLE_LOGGING, PSN_LOGFILE, ACTIVE_INACTIVE_NOTIFICATION, GAME_CHANGE_NOTIFICATION, ERROR_NOTIFICATION, PSN_CHECK_INTERVAL, PSN_ACTIVE_CHECK_INTERVAL, SMTP_PASSWORD, TRUNCATE_CHARS, EXPORTED_SECRET_KEYS, COLORED_OUTPUT, WEBHOOK_ENABLED, stdout_bck, DEBUG_MODE
+    global CLI_CONFIG_PATH, CONFIG_DISCOVERY_DISABLED, DOTENV_FILE, PSN_STATUS_FILE, LOCAL_TIMEZONE, LOCAL_TIMEZONE_STATE, LIVENESS_REMINDER_SECONDS, PSN_NPSSO, CSV_FILE, DISABLE_LOGGING, PSN_LOGFILE, ACTIVE_INACTIVE_NOTIFICATION, GAME_CHANGE_NOTIFICATION, ERROR_NOTIFICATION, PSN_CHECK_INTERVAL, PSN_ACTIVE_CHECK_INTERVAL, SMTP_PASSWORD, TRUNCATE_CHARS, EXPORTED_SECRET_KEYS, COLORED_OUTPUT, WEBHOOK_ENABLED, stdout_bck, DEBUG_MODE, PROMETHEUS_PORT
 
     if "--generate-config" in sys.argv:
         config_content = CONFIG_BLOCK.strip("\n") + "\n"
@@ -7858,6 +7968,14 @@ def main():
         default=None,
         help="Enable debug mode for technical logging"
     )
+    opts.add_argument(
+        "--prometheus-port",
+        dest="prometheus_port",
+        metavar="PORT",
+        type=int,
+        default=None,
+        help="Start a Prometheus metrics HTTP server on PORT (requires the 'prometheus_client' package)"
+    )
 
     args = parser.parse_args()
     DOTENV_STARTUP_ERRORS.clear()
@@ -8112,6 +8230,13 @@ def main():
     if WEBHOOK_ENABLED and not validate_webhook_url():
         verbose_print("Webhook notifications are off because WEBHOOK_URL is not a complete HTTPS link")
         WEBHOOK_ENABLED = False
+
+    if args.prometheus_port:
+        if not PROMETHEUS_AVAILABLE:
+            print_recovery_advice(missing_dependency_advice("prometheus-client", "The Prometheus metrics endpoint cannot start", "or start without --prometheus-port"))
+            sys.exit(1)
+        start_http_server(args.prometheus_port)
+        PROMETHEUS_PORT = args.prometheus_port
 
     emit_startup_summary(build_startup_summary(args.psn_user_id, cfg_path, env_path, FINAL_LOG_PATH), full_startup_summary_enabled())
 

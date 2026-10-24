@@ -15,6 +15,7 @@ The distributed package contains no vendored third-party source. It declares the
 | [tzlocal](https://pypi.org/project/tzlocal/) | MIT | Local timezone detection |
 | [python-dotenv](https://pypi.org/project/python-dotenv/) | BSD-3-Clause | Reading secrets from `.env` |
 | [wcwidth](https://pypi.org/project/wcwidth/) | MIT | Measuring display width for `TRUNCATE_CHARS` |
+| [prometheus-client](https://pypi.org/project/prometheus-client/) | Apache-2.0 | Optional `prometheus` extra: the `--prometheus-port` metrics endpoint |
 
 ## Build, test and lint dependencies
 

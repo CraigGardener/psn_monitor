@@ -131,6 +131,7 @@ Start the monitor with `--prometheus-port`:
 ```sh
 psn_monitor --prometheus-port 9595 <psn_user_id>
 # metrics available at http://0.0.0.0:9595/metrics
+# add --title-stats-interval 900 to refresh the per-title totals less often
 ```
 
 Series exposed:
@@ -144,7 +145,22 @@ Series exposed:
 | `psn_online_sessions_total` | counter | `user` | Total online sessions |
 | `psn_online_session_seconds` | histogram | `user` | Online-session durations |
 | `psn_polls_total` | counter | `user` | Presence polls performed |
-| `psn_poll_errors_total` | counter | `user`, `kind` | Polls that raised an exception (kind: `auth`, `timeout`, …) |
+| `psn_poll_errors_total` | counter | `user`, `kind` | Polls that raised an exception (kind: `auth`, `transient`, `malformed`, `exhausted`, `unknown`) |
+| `psn_title_play_seconds` | gauge | `user`, `game`, `platform` | Cumulative play time PSN reports for the title |
+| `psn_title_play_count` | gauge | `user`, `game`, `platform` | Cumulative play sessions PSN reports for the title |
+| `psn_title_last_played_timestamp_seconds` | gauge | `user`, `game`, `platform` | Unix time the title was last played |
+| `psn_title_stats_polls_total` | counter | `user` | Title statistics refreshes performed |
+| `psn_title_stats_errors_total` | counter | `user` | Title statistics refreshes that raised an exception |
+
+The `psn_title_*` series come from PSN's per-title statistics rather than
+from presence. PSN keeps publishing them to a friend when the player's
+online status is hidden (privacy set to *No one*, or *Appear Offline* on
+the console), so they are the one activity signal left in that case: the
+presence series then read offline throughout while the title totals keep
+growing. They refresh every `--title-stats-interval` seconds (default 300,
+0 disables them) and only while `--prometheus-port` is set. PSN reports
+them cumulatively and updates them when a session ends, so they give play
+time per window, not live status or session start times.
 
 Sample PromQL:
 
@@ -158,6 +174,15 @@ histogram_quantile(0.5, sum by (game, le) (rate(psn_game_session_seconds_bucket[
 # Sessions ≥ 4 hours in the last 30 days
 sum by (game) (increase(psn_game_session_seconds_bucket{le="+Inf"}[30d]))
   - on (game) sum by (game) (increase(psn_game_session_seconds_bucket{le="14400"}[30d]))
+
+# Play time per game in the last 24 hours, from the per-title totals
+sum by (game) (increase(psn_title_play_seconds[1d]))
+
+# Sessions per game this week, from the per-title play counts
+sum by (game) (increase(psn_title_play_count[7d]))
+
+# Games played in the last 24 hours
+psn_title_last_played_timestamp_seconds > time() - 86400
 ```
 
 <a id="change-log"></a>

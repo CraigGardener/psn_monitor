@@ -656,6 +656,41 @@ PROM_POLL_ERRORS = Counter(
     ["user", "kind"],
 )
 
+# Per-title statistics come from a different PSN endpoint than presence and stay visible to a friend even when
+# the player's online status is hidden (privacy set to "No one", or "Appear Offline" on the console), so they are
+# the only activity signal left in that case. PSN reports them cumulatively; the exporter republishes them as
+# gauges, and increase()/delta() over a window gives play time or sessions in that window.
+PROM_TITLE_PLAY_SECONDS = Gauge(
+    "psn_title_play_seconds",
+    "Cumulative play time PSN reports for the title, in seconds",
+    ["user", "game", "platform"],
+)
+PROM_TITLE_PLAY_COUNT = Gauge(
+    "psn_title_play_count",
+    "Cumulative number of play sessions PSN reports for the title",
+    ["user", "game", "platform"],
+)
+PROM_TITLE_LAST_PLAYED = Gauge(
+    "psn_title_last_played_timestamp_seconds",
+    "Unix time at which PSN reports the title was last played",
+    ["user", "game", "platform"],
+)
+PROM_TITLE_STATS_POLLS = Counter(
+    "psn_title_stats_polls_total",
+    "Number of title statistics refreshes performed against the PSN API",
+    ["user"],
+)
+PROM_TITLE_STATS_ERRORS = Counter(
+    "psn_title_stats_errors_total",
+    "Number of title statistics refreshes that raised an exception",
+    ["user"],
+)
+
+# Seconds between title statistics refreshes while the exporter is on; 0 disables them. Set from --title-stats-interval
+TITLE_STATS_INTERVAL = 300
+# Titles fetched per refresh, newest first; every distinct title becomes a label set, so this also bounds cardinality
+TITLE_STATS_LIMIT = 50
+
 
 # Probes the PSN OAuth endpoint with the given npsso and returns a specific error hint if the redirect carries a recognizable error such as ToSUA re-acceptance, otherwise None
 def probe_npsso_auth_error(npsso):
@@ -1739,7 +1774,7 @@ def truncate_string_per_line(message, truncate_width, tabsize=8):
 
 # Applies effective monitoring settings before preflight checks and one-shot commands
 def apply_runtime_cli_overrides(args):
-    for argument, setting in (("check_interval", "PSN_CHECK_INTERVAL"), ("active_interval", "PSN_ACTIVE_CHECK_INTERVAL")):
+    for argument, setting in (("check_interval", "PSN_CHECK_INTERVAL"), ("active_interval", "PSN_ACTIVE_CHECK_INTERVAL"), ("title_stats_interval", "TITLE_STATS_INTERVAL")):
         value = getattr(args, argument, None)
         if value is not None:
             globals()[setting] = value
@@ -4662,6 +4697,42 @@ def get_user_info(psn_user_id, include_trophies=False, show_recent_games=True):
 
 
 # Main function that monitors gaming activity of the specified PSN user
+# Refreshes the per-title statistics gauges from the PSN API and returns whether the refresh succeeded. A failure is
+# counted and logged at debug level only: the presence poll already reports the outage, and title statistics
+# are a secondary source that catches up on the next refresh
+def refresh_title_stats_metrics(psn_user, psn_user_id):
+    if platform.system() != 'Windows':
+        signal.signal(signal.SIGALRM, timeout_handler)
+        signal.alarm(FUNCTION_TIMEOUT)
+    debug_print("PSN API title_stats()", user=psn_user_id, limit=TITLE_STATS_LIMIT, page_size=50)
+    PROM_TITLE_STATS_POLLS.labels(user=psn_user_id).inc()
+    try:
+        for title in psn_user.title_stats(limit=TITLE_STATS_LIMIT, page_size=50):
+            if not title or not title.name:
+                continue
+            # The same normalisation the presence metrics use, so a game carries one label value across both sources
+            labels = {"user": psn_user_id, "game": normalize_ascii(title.name), "platform": getattr(getattr(title, "category", None), "name", "UNKNOWN")}
+            if title.play_duration is not None:
+                PROM_TITLE_PLAY_SECONDS.labels(**labels).set(int(title.play_duration.total_seconds()))
+            if title.play_count is not None:
+                PROM_TITLE_PLAY_COUNT.labels(**labels).set(int(title.play_count))
+            if title.last_played_date_time:
+                PROM_TITLE_LAST_PLAYED.labels(**labels).set(int(title.last_played_date_time.timestamp()))
+        return True
+    except Exception as e:
+        PROM_TITLE_STATS_ERRORS.labels(user=psn_user_id).inc()
+        debug_print("Title statistics refresh", user=psn_user_id, outcome="failed", error=f"{type(e).__name__}: {e}")
+        return False
+    finally:
+        if platform.system() != 'Windows':
+            signal.alarm(0)
+
+
+# Title statistics are refreshed only while the exporter has somewhere to publish them
+def title_stats_enabled():
+    return bool(PROMETHEUS_PORT) and TITLE_STATS_INTERVAL > 0
+
+
 def psn_monitor_user(psn_user_id, csv_file_name):
 
     mark_monitoring_started()
@@ -4997,6 +5068,8 @@ def psn_monitor_user(psn_user_id, csv_file_name):
 
     check_number = 0
     recovery_hints = RecoveryHintTracker()
+    # Zero so the first successful presence check also publishes the title statistics
+    title_stats_next_ts = 0
 
     # Main loop
     while True:
@@ -5145,6 +5218,11 @@ def psn_monitor_user(psn_user_id, csv_file_name):
         finally:
             if platform.system() != 'Windows':
                 signal.alarm(0)
+
+        # Rides on a successful presence check so an outage is reported once, by the presence poll, not twice
+        if title_stats_enabled() and int(time.time()) >= title_stats_next_ts:
+            refresh_title_stats_metrics(psn_user, psn_user_id)
+            title_stats_next_ts = int(time.time()) + TITLE_STATS_INTERVAL
 
         change = False
         act_inact_flag = False
@@ -6074,6 +6152,7 @@ def build_startup_summary(psn_user_id=None, config_path=None, env_path=None, log
         StartupSummaryRow("CSV output", CSV_FILE or "Disabled", concise=bool(CSV_FILE)),
         StartupSummaryRow("Status file", resolve_status_file(psn_user_id) if psn_user_id else "None"),
         StartupSummaryRow("Prometheus metrics", f"http://0.0.0.0:{PROMETHEUS_PORT}/metrics" if PROMETHEUS_PORT else "Disabled", concise=bool(PROMETHEUS_PORT)),
+        StartupSummaryRow("Title statistics", f"Every {display_time(TITLE_STATS_INTERVAL)}" if title_stats_enabled() else "Disabled", concise=title_stats_enabled()),
         StartupSummaryRow("Terminal truncation", f"{TRUNCATE_CHARS} chars" if TRUNCATE_CHARS else "Disabled", concise=bool(TRUNCATE_CHARS)),
         StartupSummaryRow("Process id", str(os.getpid())),
         StartupSummaryRow("Python version", platform.python_version()),
@@ -7894,6 +7973,13 @@ def main():
         metavar="SECONDS",
         type=int,
         help="Polling interval when user is online"
+    )
+    times.add_argument(
+        "--title-stats-interval",
+        dest="title_stats_interval",
+        metavar="SECONDS",
+        type=int,
+        help="Refresh interval for the per-title play statistics published on the Prometheus endpoint, 0 disables them (default: 300)"
     )
 
     # Features & Output

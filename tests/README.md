@@ -59,6 +59,7 @@ and again before anything is published to PyPI.
 | `test_help_screen.py` | The `--help` screen: the option groups, the worked examples and the version banner |
 | `test_output_safety.py` | Secret redaction, terminal control sequence removal, screen truncation and the single output layer |
 | `test_presence_parsing.py` | Presence payload parsing, platform labels and title normalization |
+| `test_prometheus_metrics.py` | The optional Prometheus exporter: the per-title statistics gauges, their gating on the exporter and the interval, and the summary rows that report them |
 | `test_repository_contracts.py` | Governance documents, issue templates, action pinning, release gating and the CI contract |
 | `test_repository_metadata.py` | Governance files, citation, funding, line endings, the declared editor style, the pinned linter and release integrity |
 | `test_startup_summary.py` | The startup summary rows, which view each one appears in, what the log file keeps and the welcome screen |
